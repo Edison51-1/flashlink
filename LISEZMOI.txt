@@ -1,0 +1,23 @@
+FlashLink - transfert de fichiers et dossiers entre deux PC
+===========================================================
+OBTENIR L'EXECUTABLE (Windows .exe et Linux)
+1. Creez un depot GitHub, puis envoyez-y TOUT le contenu de ce dossier
+   (y compris le dossier cache .github).
+2. Onglet "Actions" > "Construire FlashLink" > "Run workflow".
+3. Au bout de 2 a 3 minutes, telechargez FlashLink-Windows (FlashLink.exe)
+   et FlashLink-Linux en bas de la page de l'execution.
+
+CONSTRUIRE A LA MAIN (sur le systeme cible)
+   pip install pyinstaller PySide6-Essentials
+   pyinstaller --onefile --windowed --name FlashLink flashlink_qt.py
+   -> resultat dans le dossier dist/
+
+UTILISATION
+- Lancez FlashLink sur les deux PC.
+- PC 1 : onglet Recevoir > Demarrer. Un code s'affiche.
+- PC 2 : onglet Envoyer > ajoutez fichiers/dossiers > Rechercher > code > Envoyer.
+- Sans Wi-Fi : onglet Connexion (point d'acces ou cable Ethernet).
+- Pare-feu : autorisez FlashLink (reseaux prives ET publics).
+
+SANS CONSTRUIRE (avec Python) : pip install PySide6-Essentials puis python flashlink_qt.py
+(L'ancienne interface simple flashlink_gui.py reste disponible.)
