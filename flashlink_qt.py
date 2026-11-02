@@ -2,6 +2,8 @@
 """FlashLink - interface moderne (PySide6). Lancer : python flashlink_qt.py"""
 import json
 import os
+import platform
+import socket
 import sys
 import threading
 import time
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame, QHB
 import flashlink as fl
 import flashlink_core as core
 import flashlink_net as net
+from flashlink_discovery import Discovery
 
 BG, SIDE, CARD, CARD2 = "#0B1020", "#0E1630", "#121C3B", "#18244A"
 TXT, MUTED, CYAN, GREEN, LINE = "#E6EAF5", "#9AA6C3", "#22D3EE", "#4ADE80", "#2A3866"
@@ -97,6 +100,7 @@ class Bridge(QObject):
     event = Signal(str)
     netdone = Signal(bool, str)
     found = Signal(object)
+    devices = Signal(object)
     sent = Signal(bool, str)
     ask = Signal(str, int, object, object)
 
@@ -193,6 +197,17 @@ class MainWindow(QMainWindow):
         b.found.connect(self.on_found)
         b.sent.connect(self.on_sent)
         b.ask.connect(self.on_ask)
+        b.devices.connect(self.on_devices)
+        self._auto_text = ""
+        self.disc = None
+        try:
+            kind = "windows" if platform.system() == "Windows" else "linux"
+            self.disc = Discovery(socket.gethostname(), fl.PORT, platform=kind,
+                                  on_change=lambda ds: self.br.devices.emit(ds))
+            self.disc.visible = False   # on n'apparaît chez les autres que pendant la réception
+            self.disc.start()
+        except OSError:
+            self.disc = None            # port déjà pris : le bouton « Rechercher » reste disponible
         self.refresh_chip()
         self.load_hist()
 
@@ -354,7 +369,7 @@ class MainWindow(QMainWindow):
         tgt.setSpacing(10)
         self.host = QComboBox()
         self.host.setEditable(True)
-        self.host.lineEdit().setPlaceholderText("Adresse IP ou « Rechercher »")
+        self.host.lineEdit().setPlaceholderText("Les PC détectés apparaissent ici automatiquement")
         b = QPushButton("Rechercher")
         b.setObjectName("ghost")
         b.clicked.connect(self.do_discover)
@@ -424,6 +439,29 @@ class MainWindow(QMainWindow):
         self.rest.setText(f"{len(found)} PC trouvé(s)" if found else "Aucun PC trouvé : lancez « Recevoir » sur l'autre PC")
         if found:
             self.update_dest()
+
+    def on_devices(self, ds):
+        """Liste des PC visibles, mise à jour toute seule (comme le Bluetooth)."""
+        cur = self.host.currentText().strip()
+        cur_ip = cur.split()[0] if cur else ""
+        ips = [d["ip"] for d in ds]
+        self.host.blockSignals(True)
+        self.host.clear()
+        for d in ds:
+            self.host.addItem(f"{d['ip']}  ({d['name']})")
+        if cur_ip in ips:
+            self.host.setCurrentIndex(ips.index(cur_ip))
+        elif cur and cur != self._auto_text:
+            self.host.setEditText(cur)           # adresse saisie à la main : on la garde
+        elif ds:
+            self.host.setCurrentIndex(0)
+        else:
+            self.host.setEditText("")
+        if self.host.currentIndex() >= 0:
+            self._auto_text = self.host.currentText().strip()
+        self.host.blockSignals(False)
+        self.rest.setText(f"{len(ds)} PC visible(s)" if ds else "Aucun PC visible : lancez « Recevoir » sur l'autre PC")
+        self.update_dest()
 
     def update_dest(self):
         t = self.host.currentText().strip()
@@ -533,6 +571,8 @@ class MainWindow(QMainWindow):
         if self.receiver:
             self.receiver.stop()
             self.receiver = None
+            if self.disc:
+                self.disc.set_visible(False)
             self.recv_btn.setText("Démarrer la réception")
             self.on_event("Réception arrêtée.")
             return
@@ -548,6 +588,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "FlashLink", f"Impossible de démarrer ({e}).\nFlashLink est-il déjà ouvert ?")
             return
         self.recv_btn.setText("Arrêter la réception")
+        if self.disc:
+            self.disc.set_visible(True)
         ips = net.local_ips()
         self.addr.setText("Adresse de ce PC : " + (", ".join(ips) if ips else "aucune (pas de réseau)"))
         self.on_event("En attente d'un envoi...")
@@ -662,6 +704,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         if self.receiver:
             self.receiver.stop()
+        if self.disc:
+            self.disc.stop()
         super().closeEvent(e)
 
 
