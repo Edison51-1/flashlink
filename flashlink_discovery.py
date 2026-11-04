@@ -46,8 +46,8 @@ def _interfaces():
 
 class Discovery:
     def __init__(self, name, tcp_port, platform="pc", on_change=None,
-                 extra_targets=(), port=DISCOVERY_PORT):
-        self.id = uuid.uuid4().hex[:12]
+                 extra_targets=(), port=DISCOVERY_PORT, device_id=None):
+        self.id = device_id or uuid.uuid4().hex[:12]
         self.name, self.tcp_port, self.platform = name, tcp_port, platform
         self.on_change, self.extra_targets, self.port = on_change, list(extra_targets), port
         self.visible = True

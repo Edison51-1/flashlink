@@ -9,7 +9,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QObject, QSize, Qt, Signal
+from PySide6.QtCore import QByteArray, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
@@ -21,10 +21,17 @@ import flashlink as fl
 import flashlink_core as core
 import flashlink_net as net
 from flashlink_discovery import Discovery
+from flashlink_pair import DeviceStore
 
 BG, SIDE, CARD, CARD2 = "#0B1020", "#0E1630", "#121C3B", "#18244A"
 TXT, MUTED, CYAN, GREEN, LINE = "#E6EAF5", "#9AA6C3", "#22D3EE", "#4ADE80", "#2A3866"
 HIST = Path.home() / ".flashlink_history.json"
+APP_VERSION = "3.10.0"
+
+
+def _clean(s):
+    """Nettoie un nom reçu du réseau avant de l'afficher (pas de balises ni de caractères bizarres)."""
+    return "".join(ch for ch in str(s) if ch.isprintable() and ch not in "<>&")[:40] or "?"
 
 ICONS = {
     "bolt": '<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>',
@@ -36,6 +43,7 @@ ICONS = {
     "file": '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
     "video": '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/>',
     "pc": '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
+    "devices": '<rect x="2" y="5" width="14" height="10" rx="2"/><path d="M6 19h6M9 15v4"/><rect x="18" y="8" width="4" height="9" rx="1"/>',
 }
 VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
 
@@ -101,6 +109,10 @@ class Bridge(QObject):
     netdone = Signal(bool, str)
     found = Signal(object)
     devices = Signal(object)
+    paircode = Signal(str, str)
+    pairdone = Signal(object)
+    pairask = Signal(str, str, str, object)
+    devrefresh = Signal()
     sent = Signal(bool, str)
     ask = Signal(str, int, object, object)
 
@@ -163,9 +175,12 @@ class ItemCard(QFrame):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, store_path=None):
         super().__init__()
-        self.setWindowTitle("FlashLink")
+        self.store = DeviceStore(store_path)
+        self.pairing, self._scan = False, False
+        self.pair_cancel_ev = threading.Event()
+        self.setWindowTitle(f"FlashLink {APP_VERSION}")
         self.resize(1040, 680)
         self.setMinimumSize(900, 600)
         self.setAcceptDrops(True)
@@ -185,10 +200,11 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         h.addWidget(self.stack, 1)
         self.stack.addWidget(self.page_conn())
+        self.stack.addWidget(self.page_dev())
         self.stack.addWidget(self.page_send())
         self.stack.addWidget(self.page_recv())
         self.stack.addWidget(self.page_hist())
-        self.goto(1)
+        self.goto(2)
         b = self.br
         b.sprog.connect(self.on_send_progress)
         b.rprog.connect(self.on_recv_progress)
@@ -198,18 +214,24 @@ class MainWindow(QMainWindow):
         b.sent.connect(self.on_sent)
         b.ask.connect(self.on_ask)
         b.devices.connect(self.on_devices)
+        b.paircode.connect(self.on_paircode)
+        b.pairdone.connect(self.on_pairdone)
+        b.pairask.connect(self.on_pairask)
+        b.devrefresh.connect(self.refresh_all)
         self._auto_text = ""
         self.disc = None
         try:
             kind = "windows" if platform.system() == "Windows" else "linux"
             self.disc = Discovery(socket.gethostname(), fl.PORT, platform=kind,
-                                  on_change=lambda ds: self.br.devices.emit(ds))
+                                  on_change=lambda ds: self.br.devices.emit(ds),
+                                  device_id=self.store.my_id)
             self.disc.visible = False   # on n'apparaît chez les autres que pendant la réception
             self.disc.start()
         except OSError:
             self.disc = None            # port déjà pris : le bouton « Rechercher » reste disponible
         self.refresh_chip()
         self.load_hist()
+        self.refresh_dev()
 
     # ----------------------------------------------------------------- structure
     def build_side(self):
@@ -227,7 +249,7 @@ class MainWindow(QMainWindow):
         logo.addWidget(t, 1)
         v.addLayout(logo)
         self.navs = []
-        for i, (nm, ic) in enumerate([("Connexion", "wifi"), ("Envoyer", "up"), ("Recevoir", "down"), ("Historique", "clock")]):
+        for i, (nm, ic) in enumerate([("Connexion", "wifi"), ("Appareils", "devices"), ("Envoyer", "up"), ("Recevoir", "down"), ("Historique", "clock")]):
             b = QPushButton("  " + nm)
             b.setObjectName("nav")
             b.setCheckable(True)
@@ -243,11 +265,11 @@ class MainWindow(QMainWindow):
         cv = QVBoxLayout(card)
         cv.setContentsMargins(16, 14, 16, 14)
         cv.setSpacing(2)
-        a = QLabel("Code de jumelage")
+        a = QLabel("Code manuel")
         a.setObjectName("muted")
         self.code_lbl = QLabel(f"{self.code[:3]} {self.code[3:]}")
         self.code_lbl.setObjectName("code")
-        c = QLabel("Code requis pour recevoir")
+        c = QLabel("Pour un PC non jumelé")
         c.setObjectName("muted")
         for w in (a, self.code_lbl, c):
             cv.addWidget(w)
@@ -284,6 +306,234 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(32, 28, 32, 24)
         v.setSpacing(18)
         return w, v
+
+    # ------------------------------------------------------------- page Appareils
+    def page_dev(self):
+        w, v = self.page()
+        row, t, sub_, chip = self.header("Appareils", "Détectez et jumelez les PC à proximité, comme en Bluetooth")
+        self.chips.append(chip)
+        v.addLayout(row)
+        card = QFrame()
+        card.setObjectName("card")
+        h = QHBoxLayout(card)
+        h.setContentsMargins(24, 18, 24, 18)
+        h.setSpacing(16)
+        h.addWidget(icon_label("pc", CYAN, 22))
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        me = QLabel(socket.gethostname())
+        me.setTextFormat(Qt.PlainText)
+        me.setStyleSheet("font-size:17px;font-weight:700;")
+        self.me_state = QLabel()
+        self.me_state.setObjectName("muted")
+        col.addWidget(me)
+        col.addWidget(self.me_state)
+        h.addLayout(col, 1)
+        self.vis_btn = QPushButton()
+        self.vis_btn.setObjectName("primary")
+        self.vis_btn.clicked.connect(self.toggle_recv)
+        h.addWidget(self.vis_btn)
+        v.addWidget(card)
+
+        self.pair_card = QFrame()
+        self.pair_card.setObjectName("cardActive")
+        pv = QVBoxLayout(self.pair_card)
+        pv.setContentsMargins(24, 18, 24, 18)
+        pv.setSpacing(6)
+        self.pair_title = QLabel()
+        self.pair_title.setTextFormat(Qt.PlainText)
+        self.pair_title.setStyleSheet("font-size:16px;font-weight:700;")
+        self.pair_code = QLabel()
+        self.pair_code.setObjectName("bigcode")
+        self.pair_msg = QLabel()
+        self.pair_msg.setObjectName("muted")
+        self.pair_msg.setWordWrap(True)
+        self.pair_msg.setTextFormat(Qt.PlainText)
+        cancel = QPushButton("Annuler")
+        cancel.setObjectName("ghost")
+        cancel.clicked.connect(self.pair_cancel_ev.set)
+        for x in (self.pair_title, self.pair_code, self.pair_msg):
+            pv.addWidget(x)
+        pv.addWidget(cancel, 0, Qt.AlignLeft)
+        self.pair_card.hide()
+        v.addWidget(self.pair_card)
+
+        lab = QLabel("Appareils jumelés")
+        lab.setStyleSheet("font-size:16px;font-weight:700;")
+        v.addWidget(lab)
+        self.paired_lay = QVBoxLayout()
+        self.paired_lay.setSpacing(8)
+        v.addLayout(self.paired_lay)
+
+        top = QHBoxLayout()
+        lab2 = QLabel("Appareils à proximité")
+        lab2.setStyleSheet("font-size:16px;font-weight:700;")
+        top.addWidget(lab2, 1)
+        self.add_btn = QPushButton("+ Ajouter un appareil")
+        self.add_btn.setObjectName("ghost")
+        self.add_btn.clicked.connect(self.toggle_scan)
+        top.addWidget(self.add_btn)
+        v.addLayout(top)
+        self.near_box = QWidget()
+        nl = QVBoxLayout(self.near_box)
+        nl.setContentsMargins(0, 0, 0, 0)
+        nl.setSpacing(8)
+        self.near_msg = QLabel()
+        self.near_msg.setObjectName("muted")
+        self.near_msg.setWordWrap(True)
+        self.near_lay = QVBoxLayout()
+        self.near_lay.setSpacing(8)
+        nl.addWidget(self.near_msg)
+        nl.addLayout(self.near_lay)
+        self.near_box.hide()
+        v.addWidget(self.near_box)
+        v.addStretch(1)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.viewport().setAutoFillBackground(False)
+        w.setObjectName("inner")
+        w.setStyleSheet("QWidget#inner{background:transparent;}")
+        sc.setWidget(w)
+        return sc
+
+    def clear_lay(self, lay):
+        while lay.count():
+            wd = lay.takeAt(0).widget()
+            if wd:
+                wd.deleteLater()
+
+    def dev_row(self, name, sub_, buttons):
+        f = QFrame()
+        f.setObjectName("card")
+        h = QHBoxLayout(f)
+        h.setContentsMargins(18, 12, 18, 12)
+        h.setSpacing(14)
+        h.addWidget(icon_label("pc", CYAN, 20, CARD2, 40))
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        a = QLabel(_clean(name))
+        a.setTextFormat(Qt.PlainText)
+        a.setStyleSheet("font-weight:600;font-size:15px;")
+        b = QLabel(sub_)
+        b.setObjectName("muted")
+        b.setTextFormat(Qt.PlainText)
+        col.addWidget(a)
+        col.addWidget(b)
+        h.addLayout(col, 1)
+        for label, primary, cb in buttons:
+            btn = QPushButton(label)
+            btn.setObjectName("primary" if primary else "ghost")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(cb)
+            h.addWidget(btn)
+        return f
+
+    def refresh_all(self):
+        self.on_devices(self.disc.devices() if self.disc else [])
+
+    def refresh_dev(self):
+        """Met à jour l'onglet Appareils (visibilité, appareils jumelés, appareils à proximité)."""
+        on = self.receiver is not None
+        self.vis_btn.setText("Devenir invisible" if on else "Devenir visible")
+        self.me_state.setText("Visible : les autres PC peuvent vous trouver et se jumeler avec vous" if on
+                              else "Invisible : cliquez sur « Devenir visible » pour être détecté par les autres PC")
+        ds = {d["id"]: d for d in (self.disc.devices() if self.disc else [])}
+        paired = self.store.paired()
+        self.clear_lay(self.paired_lay)
+        if not paired:
+            lab = QLabel("Aucun appareil jumelé pour l'instant. Cliquez sur « Ajouter un appareil ».")
+            lab.setObjectName("muted")
+            self.paired_lay.addWidget(lab)
+        for pid, p in paired.items():
+            d = ds.get(pid)
+            btns = ([("Envoyer", True, lambda _=False, i=pid: self.send_to(i))] if d else [])
+            btns.append(("Oublier", False, lambda _=False, i=pid: self.forget(i)))
+            self.paired_lay.addWidget(self.dev_row(p["name"], f"En ligne · {d['ip']}" if d else "Hors ligne", btns))
+        self.clear_lay(self.near_lay)
+        near = sorted((d for i, d in ds.items() if i not in paired), key=lambda d: d["name"].lower())
+        if not self.disc:
+            self.near_msg.setText("La détection automatique est indisponible (le port est déjà utilisé par un autre programme).")
+        elif near:
+            self.near_msg.setText("Cliquez sur « Jumeler » à côté du PC voulu.")
+        else:
+            self.near_msg.setText("Recherche en cours... Sur l'autre PC, ouvrez FlashLink et cliquez sur « Devenir visible ».")
+        for d in near:
+            self.near_lay.addWidget(self.dev_row(d["name"], d["ip"], [("Jumeler", True, lambda _=False, x=d: self.start_pair(x))]))
+
+    def toggle_scan(self):
+        self._scan = not self._scan
+        self.near_box.setVisible(self._scan)
+        self.add_btn.setText("Fermer" if self._scan else "+ Ajouter un appareil")
+        self.refresh_dev()
+
+    def start_pair(self, d):
+        if self.pairing:
+            return
+        self.pairing = True
+        self.pair_cancel_ev.clear()
+        self._pair_ip = d["ip"]
+        self.pair_title.setText(f"Jumelage avec {_clean(d['name'])}")
+        self.pair_code.setText("······")
+        self.pair_msg.setText("Connexion en cours...")
+        self.pair_card.show()
+
+        def work():
+            res = core.pair_with(d["ip"], self.store.my_id, socket.gethostname(), port=d["port"],
+                                 on_code=lambda c, n: self.br.paircode.emit(c, n), cancel=self.pair_cancel_ev)
+            self.br.pairdone.emit(res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_paircode(self, code, name):
+        self.pair_code.setText(f"{code[:3]} {code[3:]}")
+        self.pair_msg.setText(f"Vérifiez que ce même code s'affiche sur {_clean(name)}. Le jumelage se termine quand il accepte.")
+
+    def on_pairdone(self, res):
+        self.pairing = False
+        if res.get("ok"):
+            self.store.add(res["id"], _clean(res["name"]), res["key"], getattr(self, "_pair_ip", ""))
+            self.pair_code.setText("✓")
+            self.pair_msg.setText(f"Jumelé avec {_clean(res['name'])}. Vous pouvez maintenant lui envoyer des fichiers sans code.")
+            self.on_event(f"Jumelé avec {_clean(res['name'])}.")
+        else:
+            self.pair_code.setText("✗")
+            self.pair_msg.setText(str(res.get("msg", "Jumelage échoué.")))
+        QTimer.singleShot(4000, self.pair_card.hide)
+        self.refresh_all()
+
+    def pair_blocking(self, name, peer_id, code, ip):
+        h = {"ev": threading.Event(), "ok": False}
+        self.br.pairask.emit(name, ip, code, h)
+        h["ev"].wait(130)
+        return h["ok"]
+
+    def on_pairask(self, name, ip, code, h):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.goto(1)
+        r = QMessageBox.question(self, "FlashLink", f"{_clean(name)} ({ip}) veut se jumeler avec ce PC.\n\n"
+                                 f"Code de jumelage : {code[:3]} {code[3:]}\n\n"
+                                 f"Vérifiez que ce même code s'affiche sur {_clean(name)}, puis cliquez sur Oui.")
+        h["ok"] = r == QMessageBox.Yes
+        h["ev"].set()
+
+    def on_paired_rx(self, peer_id, name, key, ip):
+        self.store.add(peer_id, _clean(name), key, ip)
+        self.br.devrefresh.emit()
+
+    def forget(self, pid):
+        name = (self.store.paired().get(pid) or {}).get("name", "cet appareil")
+        if QMessageBox.question(self, "FlashLink", f"Oublier {name} ? Il faudra le jumeler à nouveau pour lui envoyer des fichiers sans code.") == QMessageBox.Yes:
+            self.store.forget(pid)
+            self.refresh_all()
+
+    def send_to(self, pid):
+        self.goto(2)
+        for i in range(self.host.count()):
+            d = self.host.itemData(i)
+            if isinstance(d, dict) and d.get("id") == pid:
+                self.host.setCurrentIndex(i)
+                break
 
     # --------------------------------------------------------------- page Envoyer
     def page_send(self):
@@ -389,6 +639,7 @@ class MainWindow(QMainWindow):
         v.addLayout(tgt)
         ctl.addWidget(self.send_btn)
         ctl.addWidget(self.cancel_btn)
+        self.host.currentTextChanged.connect(lambda _t: self.on_sel_changed())
         return w
 
     def dragEnterEvent(self, e):
@@ -399,7 +650,7 @@ class MainWindow(QMainWindow):
         for u in e.mimeData().urls():
             if u.isLocalFile():
                 self.add_path(u.toLocalFile())
-        self.goto(1)
+        self.goto(2)
 
     def add_files(self):
         for p in QFileDialog.getOpenFileNames(self, "Choisir des fichiers")[0]:
@@ -440,44 +691,64 @@ class MainWindow(QMainWindow):
         if found:
             self.update_dest()
 
+    def sel(self):
+        """PC choisi pour l'envoi : {'ip','port','name','id','key'} (id=None si adresse saisie à la main)."""
+        t = self.host.currentText().strip()
+        if not t:
+            return None
+        i = self.host.currentIndex()
+        if i >= 0 and self.host.itemText(i) == t and isinstance(self.host.itemData(i), dict):
+            return self.host.itemData(i)
+        return {"ip": t.split()[0], "port": fl.PORT, "name": "PC destinataire", "id": None, "key": None}
+
     def on_devices(self, ds):
         """Liste des PC visibles, mise à jour toute seule (comme le Bluetooth)."""
-        cur = self.host.currentText().strip()
-        cur_ip = cur.split()[0] if cur else ""
-        ips = [d["ip"] for d in ds]
+        paired = self.store.paired()
+        cur = self.sel()
+        cur_id = cur.get("id") if cur else None
+        manual = self.host.currentText().strip() if (cur and cur.get("id") is None) else ""
         self.host.blockSignals(True)
         self.host.clear()
         for d in ds:
-            self.host.addItem(f"{d['ip']}  ({d['name']})")
-        if cur_ip in ips:
-            self.host.setCurrentIndex(ips.index(cur_ip))
-        elif cur and cur != self._auto_text:
-            self.host.setEditText(cur)           # adresse saisie à la main : on la garde
+            key = (paired.get(d["id"]) or {}).get("key")
+            label = f"{d['ip']}  ({_clean(d['name'])})  " + ("✓ jumelé" if key else "· code requis")
+            self.host.addItem(label, {"ip": d["ip"], "port": d["port"], "name": _clean(d["name"]),
+                                      "id": d["id"], "key": key})
+        ids = [d["id"] for d in ds]
+        if cur_id in ids:
+            self.host.setCurrentIndex(ids.index(cur_id))
+        elif manual:
+            self.host.setEditText(manual)         # adresse saisie à la main : on la garde
         elif ds:
             self.host.setCurrentIndex(0)
         else:
             self.host.setEditText("")
-        if self.host.currentIndex() >= 0:
-            self._auto_text = self.host.currentText().strip()
         self.host.blockSignals(False)
-        self.rest.setText(f"{len(ds)} PC visible(s)" if ds else "Aucun PC visible : lancez « Recevoir » sur l'autre PC")
+        self.rest.setText(f"{len(ds)} PC visible(s)" if ds else "Aucun PC visible : il doit cliquer sur « Devenir visible »")
+        self.on_sel_changed()
+        self.refresh_dev()
+
+    def on_sel_changed(self):
+        s = self.sel()
+        paired = bool(s and s.get("key"))
+        self.code_in.setEnabled(not paired)
+        self.code_in.setPlaceholderText("Appareil jumelé : aucun code" if paired else "Code du récepteur")
         self.update_dest()
 
     def update_dest(self):
-        t = self.host.currentText().strip()
-        if t:
-            parts = t.split(None, 1)
-            self.dst_ip.setText(parts[0])
-            self.dst_name.setText(parts[1].strip("()") if len(parts) > 1 else "PC destinataire")
+        s = self.sel()
+        if s:
+            self.dst_ip.setText(s["ip"])
+            self.dst_name.setText(s["name"])
 
     def do_send(self):
-        t = self.host.currentText().strip()
-        code = self.code_in.text().strip()
-        if not self.paths or not t or not code:
-            QMessageBox.information(self, "FlashLink", "Ajoutez des éléments, choisissez le PC destinataire et saisissez son code.")
+        s = self.sel()
+        code = (s or {}).get("key") or self.code_in.text().strip()
+        if not self.paths or not s or not code:
+            QMessageBox.information(self, "FlashLink", "Ajoutez des éléments, choisissez le PC destinataire (jumelé, ou saisissez son code).")
             return
         self.update_dest()
-        host = t.split()[0]
+        host, port = s["ip"], s.get("port", fl.PORT)
         self.cancel.clear()
         self.sending = True
         self.send_btn.setEnabled(False)
@@ -487,7 +758,7 @@ class MainWindow(QMainWindow):
         paths = list(self.paths)
 
         def work():
-            ok, msg = core.send_files(host, code, paths, on_progress=lambda d, t, s: self.br.sprog.emit(d, t, s),
+            ok, msg = core.send_files(host, code, paths, port=port, my_id=self.store.my_id, on_progress=lambda d, t, s: self.br.sprog.emit(d, t, s),
                                       cancel=self.cancel)
             self.br.sent.emit(ok, msg)
         threading.Thread(target=work, daemon=True).start()
@@ -575,13 +846,16 @@ class MainWindow(QMainWindow):
                 self.disc.set_visible(False)
             self.recv_btn.setText("Démarrer la réception")
             self.on_event("Réception arrêtée.")
+            self.refresh_dev()
             return
         try:
             self.receiver = core.Receiver(
                 self.dest.text(), code=self.code,
                 ask=self.ask_blocking,
                 on_progress=lambda d, t, s: self.br.rprog.emit(d, t, s),
-                on_event=self.br.event.emit)
+                on_event=self.br.event.emit,
+                pair=self.pair_blocking, get_key=self.store.get_key,
+                on_paired=self.on_paired_rx, my_id=self.store.my_id)
             self.receiver.start()
         except OSError as e:
             self.receiver = None
@@ -593,6 +867,7 @@ class MainWindow(QMainWindow):
         ips = net.local_ips()
         self.addr.setText("Adresse de ce PC : " + (", ".join(ips) if ips else "aucune (pas de réseau)"))
         self.on_event("En attente d'un envoi...")
+        self.refresh_dev()
 
     def ask_blocking(self, sender, n, total):
         h = {"ev": threading.Event(), "ok": False}
@@ -601,7 +876,7 @@ class MainWindow(QMainWindow):
         return h["ok"]
 
     def on_ask(self, sender, n, total, h):
-        r = QMessageBox.question(self, "FlashLink", f"{sender} veut envoyer {n} fichier(s) ({fl.fmt_size(total)}).\nAccepter ?")
+        r = QMessageBox.question(self, "FlashLink", f"{_clean(sender)} veut envoyer {n} fichier(s) ({fl.fmt_size(total)}).\nAccepter ?")
         h["ok"] = r == QMessageBox.Yes
         h["ev"].set()
 

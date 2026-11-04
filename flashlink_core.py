@@ -3,12 +3,14 @@ import hashlib
 import hmac
 import os
 import secrets
+import select
 import socket
 import threading
 import time
 from pathlib import Path
 
 import flashlink as fl
+import flashlink_pair as pairing
 
 
 class Meter:
@@ -30,7 +32,7 @@ def _check(cancel):
         raise ConnectionError("annulé")
 
 
-def send_files(host, code, paths, port=fl.PORT, on_progress=None, cancel=None):
+def send_files(host, code, paths, port=fl.PORT, on_progress=None, cancel=None, my_id=None):
     """Retourne (ok, message)."""
     try:
         files, dirs = fl.build_manifest(paths)
@@ -46,7 +48,7 @@ def send_files(host, code, paths, port=fl.PORT, on_progress=None, cancel=None):
     sock.settimeout(60)
     rfile = sock.makefile("rb", 1 << 20)
     try:
-        fl.send_json(sock, {"magic": fl.MAGIC, "name": socket.gethostname()})
+        fl.send_json(sock, {"magic": fl.MAGIC, "name": socket.gethostname(), **({"id": my_id} if my_id else {})})
         hello = fl.read_json(rfile)
         manifest = {"files": [{"path": f["path"], "size": f["size"]} for f in files], "dirs": dirs}
         fl.send_json(sock, {"auth": fl.auth_tag(code, hello["nonce"]), "manifest": manifest})
@@ -87,10 +89,55 @@ def send_files(host, code, paths, port=fl.PORT, on_progress=None, cancel=None):
         sock.close()
 
 
+def pair_with(host, my_id, my_name, port=fl.PORT, on_code=None, cancel=None, timeout=130):
+    """Jumelage, côté PC qui demande. Retourne {ok, msg, id, name, key}."""
+    def fail(m):
+        return {"ok": False, "msg": m}
+    priv, pub = pairing.new_keypair()
+    try:
+        sock = socket.create_connection((host, port), timeout=15)
+    except OSError as e:
+        return fail(f"Impossible de joindre {host} ({e})")
+    sock.settimeout(30)
+    rfile = sock.makefile("rb")
+    try:
+        fl.send_json(sock, {"magic": fl.MAGIC, "name": my_name, "mode": "pair",
+                            "id": my_id, "pub": format(pub, "x")})
+        r1 = fl.read_json(rfile)
+        if r1.get("ok") is False:
+            return fail("Refusé : " + str(r1.get("error", "inconnu")))
+        if "pub" not in r1:
+            return fail("Cet appareil utilise une ancienne version de FlashLink : mettez-le à jour.")
+        peer_pub = int(str(r1["pub"])[:600], 16)
+        peer_id, peer_name = str(r1["id"])[:32], str(r1.get("name", "?"))[:40]
+        k = pairing.secret(priv, peer_pub)
+        if on_code:
+            on_code(pairing.confirmation_code(k, pub, peer_pub), peer_name)
+        deadline = time.time() + timeout
+        while not select.select([sock], [], [], 0.5)[0]:   # attente de la confirmation de l'autre PC
+            _check(cancel)
+            if time.time() > deadline:
+                return fail("Pas de réponse de l'autre PC.")
+        r2 = fl.read_json(rfile)
+        if not r2.get("ok"):
+            return fail("Refusé : " + str(r2.get("error", "l'autre PC a refusé")))
+        key = pairing.pair_key(k, pub, peer_pub)
+        if not hmac.compare_digest(str(r2.get("proof", "")), pairing.proof(key)):
+            return fail("Vérification échouée : jumelage annulé.")
+        return {"ok": True, "msg": "Jumelage réussi", "id": peer_id, "name": peer_name, "key": key}
+    except ConnectionError as e:
+        return fail(str(e))
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return fail(f"Jumelage interrompu ({e})")
+    finally:
+        sock.close()
+
+
 class Receiver:
     """Serveur de réception. ask(sender, nb_fichiers, total) -> bool (peut bloquer)."""
 
-    def __init__(self, dest, code=None, ask=None, on_progress=None, on_event=None, port=fl.PORT):
+    def __init__(self, dest, code=None, ask=None, on_progress=None, on_event=None, port=fl.PORT,
+                 pair=None, get_key=None, on_paired=None, my_id=""):
         self.dest = Path(dest)
         self.code = code or f"{secrets.randbelow(10**6):06d}"
         self.ask = ask or (lambda *a: True)
@@ -99,6 +146,8 @@ class Receiver:
         self.port = port
         self.stop_ev = threading.Event()
         self.srv = None
+        self.pair, self.get_key, self.on_paired, self.my_id = pair, get_key, on_paired, my_id
+        self._pair_lock = threading.Lock()
 
     def start(self):
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -127,6 +176,38 @@ class Receiver:
                 break
             threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
 
+    def _pair(self, conn, hello, addr):
+        """Jumelage, côté PC qui répond : affiche le code, attend l'accord de l'utilisateur."""
+        if not self.pair or not self._pair_lock.acquire(blocking=False):
+            fl.send_json(conn, {"ok": False, "error": "occupé ou indisponible"})
+            return
+        try:
+            try:
+                peer_pub = int(str(hello.get("pub", ""))[:600], 16)
+                peer_id = str(hello["id"])[:32]
+                if not pairing.valid_pub(peer_pub):
+                    raise ValueError
+            except (ValueError, KeyError):
+                fl.send_json(conn, {"ok": False, "error": "demande invalide"})
+                return
+            priv, pub = pairing.new_keypair()
+            k = pairing.secret(priv, peer_pub)
+            code = pairing.confirmation_code(k, peer_pub, pub)
+            name = str(hello.get("name", addr[0]))[:40]
+            fl.send_json(conn, {"pub": format(pub, "x"), "id": self.my_id, "name": socket.gethostname()})
+            conn.settimeout(150)
+            if not self.pair(name, peer_id, code, addr[0]):
+                fl.send_json(conn, {"ok": False, "error": "refusé par l'utilisateur"})
+                self.on_event(f"Jumelage avec {name} refusé.")
+                return
+            key = pairing.pair_key(k, peer_pub, pub)
+            fl.send_json(conn, {"ok": True, "proof": pairing.proof(key)})
+            if self.on_paired:
+                self.on_paired(peer_id, name, key, addr[0])
+            self.on_event(f"Jumelé avec {name}.")
+        finally:
+            self._pair_lock.release()
+
     def _handle(self, conn, addr):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
@@ -136,10 +217,16 @@ class Receiver:
             hello = fl.read_json(rfile)
             if hello.get("magic") != fl.MAGIC:
                 return
+            if hello.get("mode") == "pair":
+                self._pair(conn, hello, addr)
+                return
             nonce = secrets.token_hex(16)
             fl.send_json(conn, {"nonce": nonce})
             msg = fl.read_json(rfile)
-            if not hmac.compare_digest(msg.get("auth", ""), fl.auth_tag(self.code, nonce)):
+            got = str(msg.get("auth", ""))
+            peer_key = self.get_key(str(hello.get("id", ""))) if (self.get_key and hello.get("id")) else None
+            if not (hmac.compare_digest(got, fl.auth_tag(self.code, nonce))
+                    or (peer_key and hmac.compare_digest(got, fl.auth_tag(peer_key, nonce)))):
                 fl.send_json(conn, {"ok": False, "error": "code incorrect"})
                 self.on_event(f"Connexion refusée depuis {addr[0]} : mauvais code.")
                 return
