@@ -1,23 +1,64 @@
-FlashLink - transfert de fichiers et dossiers entre deux PC
-===========================================================
-OBTENIR L'EXECUTABLE (Windows .exe et Linux)
-1. Creez un depot GitHub, puis envoyez-y TOUT le contenu de ce dossier
-   (y compris le dossier cache .github).
-2. Onglet "Actions" > "Construire FlashLink" > "Run workflow".
-3. Au bout de 2 a 3 minutes, telechargez FlashLink-Windows (FlashLink.exe)
-   et FlashLink-Linux en bas de la page de l'execution.
+NexaLink - transfert de fichiers et dossiers entre PC (Windows / Linux)
+=======================================================================
+OBTENIR LES EXECUTABLES ET L'ASSISTANT D'INSTALLATION
+1. Envoyez ce dossier sur GitHub (y compris le dossier cache .github).
+2. Onglet "Actions" > "Construire NexaLink" (se lance aussi a chaque envoi) > "Run workflow".
+3. Au bout de 3 a 6 minutes, telechargez en bas de la page de l'execution :
+   - NexaLink-Windows-Installateur : NexaLink-Setup-3.13.0.exe (assistant d'installation)
+   - NexaLink-Windows-Portable     : NexaLink.exe (sans installation)
+   - NexaLink-Linux                : NexaLink
+L'assistant d'installation ajoute les raccourcis, autorise le pare-feu et permet de desinstaller.
 
-CONSTRUIRE A LA MAIN (sur le systeme cible)
-   pip install pyinstaller PySide6-Essentials
-   pyinstaller --onefile --windowed --name FlashLink flashlink_qt.py
-   -> resultat dans le dossier dist/
+AVEC PYTHON (sans construire) : pip install PySide6-Essentials puis python flashlink_qt.py
 
-UTILISATION
-- Lancez FlashLink sur les deux PC.
-- PC 1 : onglet Recevoir > Demarrer. Un code s'affiche.
-- PC 2 : onglet Envoyer > ajoutez fichiers/dossiers > Rechercher > code > Envoyer.
-- Sans Wi-Fi : onglet Connexion (point d'acces ou cable Ethernet).
-- Pare-feu : autorisez FlashLink (reseaux prives ET publics).
+DETECTION AUTOMATIQUE DES PC (nouveau)
+- Plus besoin de taper une adresse IP : les PC qui ont demarre la reception apparaissent tout seuls
+  dans la liste de l'onglet Envoyer (comme la liste Bluetooth).
+- Un PC n'est visible que pendant que sa reception est demarree. Le code a 6 chiffres reste obligatoire.
+- Ca marche sur le meme Wi-Fi, avec un cable Ethernet ou un point d'acces (onglet Connexion).
+- Le champ reste modifiable : on peut toujours saisir une adresse a la main.
+- Optionnel : pip install psutil ameliore la detection sur les reseaux inhabituels.
+- Pour le telephone Android : voir FlashLinkDiscovery.kt (meme protocole, port UDP 47474).
 
-SANS CONSTRUIRE (avec Python) : pip install PySide6-Essentials puis python flashlink_qt.py
-(L'ancienne interface simple flashlink_gui.py reste disponible.)
+DETECTION AUTOMATIQUE DES PC (nouveau)
+- Plus besoin de taper une adresse IP : les PC qui ont demarre la reception apparaissent tout seuls
+  dans la liste de l'onglet Envoyer (comme la liste Bluetooth).
+- Un PC n'est visible que pendant que sa reception est demarree. Le code a 6 chiffres reste obligatoire.
+- Ca marche sur le meme Wi-Fi, avec un cable Ethernet ou un point d'acces (onglet Connexion).
+- Le champ reste modifiable : on peut toujours saisir une adresse a la main.
+- Optionnel : pip install psutil ameliore la detection sur les reseaux inhabituels.
+- Pour le telephone Android : voir FlashLinkDiscovery.kt (meme protocole, port UDP 47474).
+
+VERSION 3.10.0 - ONGLET « APPAREILS » (fonctionnement type Bluetooth)
+1. Onglet Appareils > « Devenir visible » : le PC peut etre trouve par les autres (il demarre la reception).
+2. Sur l'autre PC : Appareils > « + Ajouter un appareil » : les PC visibles apparaissent tout seuls.
+3. Clic sur « Jumeler » : les deux PC affichent le MEME code a 6 chiffres. On verifie qu'il est identique,
+   puis l'autre PC clique sur « Oui ». La cle de jumelage est echangee et enregistree automatiquement.
+4. Ensuite, dans l'onglet Envoyer, on choisit le PC jumele dans la liste : plus aucun code a saisir.
+5. « Oublier » (onglet Appareils) supprime le jumelage. Un PC non jumele peut toujours recevoir avec le code manuel.
+Les cles sont gardees dans le fichier ~/.flashlink_devices.json (ne le partagez pas).
+Nouveaux fichiers : flashlink_pair.py (jumelage). Fichiers modifies : flashlink_qt.py, flashlink_core.py,
+flashlink_discovery.py. Les deux PC doivent avoir la version 3.10.0 pour se jumeler.
+
+VERSION 3.11.0
+- « Visibilité » : interrupteur dans l'onglet Appareils (remplace « Devenir visible »).
+- Envoi vers un PC detecte mais non jumele : le jumelage se fait tout seul (code envoye automatiquement,
+  confirmation sur l'autre PC), puis l'envoi continue sans rien retaper.
+- Jumelage perdu ou desynchronise : renouvele automatiquement au prochain envoi.
+- « Oublier » previent l'autre PC, qui oublie aussi le jumelage.
+- Option « Accepter automatiquement les envois des appareils jumeles ».
+- Detection dans les deux sens, meme pour un PC qui partage un point d'acces Wi-Fi (plusieurs reseaux).
+- Windows ne se met plus en veille pendant un transfert.
+- Interface : barre laterale avec nom du PC et etat de visibilite, pastilles en ligne / hors ligne, champ de code masque pour un PC detecte.
+- Pare-feu : TCP 50555, UDP 50556 et UDP 47474.
+
+VERSION 3.12.0 - PLUSIEURS PC SUR LE MEME RESEAU
+- Onglet Envoyer : chaque PC detecte apparait comme une carte. On clique sur un ou plusieurs PC (ou sur « Tous »),
+  puis sur « Envoyer » : les fichiers partent vers chaque PC choisi, l'un apres l'autre.
+- Un PC non jumele est jumele automatiquement (confirmation sur ce PC), puis l'envoi continue.
+- S'il y a plusieurs PC detectes et qu'aucun n'est choisi, rien n'est envoye (pas d'envoi au mauvais PC).
+- Un resume indique pour chaque PC si l'envoi a reussi ; l'historique garde une ligne par PC.
+
+VERSION 3.13.0 - NEXALINK
+- Le logiciel s'appelle NexaLink (icone : deux ecrans relies). Les jumelages existants sont conserves.
+- Assistant d'installation Windows (installer.iss) construit par GitHub Actions.

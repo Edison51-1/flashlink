@@ -68,7 +68,7 @@ def start_hotspot():
     if IS_LINUX:
         if not shutil.which("nmcli"):
             return False, "NetworkManager (nmcli) est introuvable. Installez-le ou créez le point d'accès à la main.", None
-        ssid, pw = "FlashLink-" + secrets.token_hex(2), _password()
+        ssid, pw = "NexaLink-" + secrets.token_hex(2), _password()
         rc, out = _run(["nmcli", "device", "wifi", "hotspot", "ssid", ssid, "password", pw])
         if rc != 0:
             return False, f"Echec nmcli : {out}\n(Essayez avec sudo, et vérifiez que le Wi-Fi est activé.)", None

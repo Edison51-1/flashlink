@@ -66,13 +66,15 @@ class DeviceStore:
     def __init__(self, path=None):
         self.path = Path(path) if path else Path.home() / ".flashlink_devices.json"
         self._lock = threading.Lock()
-        self._d = {"id": "", "paired": {}}
+        self._d = {"id": "", "paired": {}, "settings": {}}
         try:
             self._d.update(json.loads(self.path.read_text("utf-8")))
         except (OSError, ValueError):
             pass
         if not isinstance(self._d.get("paired"), dict):
             self._d["paired"] = {}
+        if not isinstance(self._d.get("settings"), dict):
+            self._d["settings"] = {}
         if not self._d.get("id"):
             self._d["id"] = secrets.token_hex(6)
             self._save()
@@ -80,6 +82,15 @@ class DeviceStore:
     @property
     def my_id(self):
         return self._d["id"]
+
+    def setting(self, name, default=None):
+        with self._lock:
+            return self._d["settings"].get(name, default)
+
+    def set_setting(self, name, value):
+        with self._lock:
+            self._d["settings"][name] = value
+            self._save()
 
     def paired(self):
         with self._lock:
